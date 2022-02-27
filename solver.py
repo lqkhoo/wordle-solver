@@ -5,10 +5,11 @@ from wordlist import ( WordleWordlist )
 class WordleSolver(object):
     
     def __init__(self, wordlist: WordleWordlist):
+
         self._wordlist: WordleWordlist = wordlist
-        self._valid_gpu = None
-        self._candidates_gpu = None
-        self._response_keys_gpu = None
+        self._valid_gpu: cp.ndarray         = None # dtype ubyte
+        self._candidates_gpu: cp.ndarray    = None # dtype ubyte
+        self._response_keys_gpu: cp.ndarray = None # dtype int
         self.has_gpu: bool = False
 
         n_devices = cp.cuda.runtime.getDeviceCount()
@@ -75,7 +76,6 @@ class WordleSolver(object):
         # 2 == exact match
 
         xp = cp.get_array_module(guess)
-
         # Increase dimensionality if we're getting flat arrays
         if len(xp.shape(guess)) == 1: guess = guess[None,:]
         if len(xp.shape(truth)) == 1: truth = truth[:,None]
@@ -83,21 +83,16 @@ class WordleSolver(object):
         g, k = xp.shape(guess) # k == self.codeword_length
         t, _ = xp.shape(truth)
 
-        result = xp.zeros((t, g, k), dtype=int)
-
-        exact_matches = (guess == truth[:,None,:])        # (t, g, k)
-        inexact_matches = xp.zeros((t, g, k), dtype=bool) # (t, g, k)
-        for i in range(t):
-            inexact_matches[i,:,:] = xp.isin(guess, truth[i], assume_unique=False)
-        inexact_matches = inexact_matches & ~exact_matches # (t, g, k)
-
-        result += exact_matches * 2 + inexact_matches * 1
-        return result.transpose((1,0,2)) # (g, t, k)
+        exact_matches = (guess == truth[:,None,:]).transpose(1,0,2)           # (g, t, k)
+        inexact_matches = (guess.reshape(-1) == truth[:,:,None]).any(axis=1)  # ((g*k) == (t,k,1)) ==> (g, k, t*k).any(axis=1) ==> (g, t*k)
+        inexact_matches = inexact_matches.reshape((t,g,k)).transpose((1,0,2)) # (g, t, k)
+        inexact_matches = inexact_matches & ~exact_matches
+        result = (exact_matches * 2 + inexact_matches * 1).astype(int)
+        return result # (g, t, k)
     
 
-    def compute_information(self, candidates: np.ndarray, valid: np.ndarray, eliminated: np.ndarray=None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        # Note: method doesn't return information directly. It returns partition
-        # sizes, which could be used to compute information.
+    def compute_partition_sizes(self, candidates: np.ndarray, valid: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        # TODO: What this method does exactly.
         # @param candidates: array of remaining candidate words.
         # @param valid: array of valid words (constant every iteration).
         # @param eliminated: array of all candidate words eliminated from previous cycles.
@@ -112,14 +107,11 @@ class WordleSolver(object):
         v, _ = xp.shape(valid)
         p = c + v
 
-        if eliminated is None:
-            pool = xp.vstack((candidates, valid)) # (p, k)
-        else:
-            pool = xp.vstack((candidates, eliminated, valid))
+        pool = xp.vstack((candidates, valid)) # (p, k)
 
         # For every possible solution, get its response vector for every possible guess.
         r = self.get_response(pool, candidates) # (p, c, k)
-
+        
         # (p, c) matrix. Each row (for each guess) contains
         # the response key encoding the appropriate response vector for each possible solution.
         responses = xp.zeros((p, c), dtype=int)

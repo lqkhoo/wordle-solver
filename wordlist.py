@@ -1,7 +1,8 @@
 import numpy as np
 
 
-# Symbol sets
+# Symbol sets.
+# Implementation assumes fewer than 255 symbols used to allow representing codewords with ubyte arrays.
 SYM_ENGLISH = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z"]
 
 
@@ -14,14 +15,16 @@ class WordleWordlist(object):
         # @param candidates_path: Filepath to txt file of codewords in the solution set.
         # @param valid_words_path: Filepath to codewords not in the solution set, but are nontheless accepted as valid guesses.
 
+        assert(len(symbols < 256)) # Enforce limitation for encoding codewords in ubytes.
+
         self.symbols: list[str]         = symbols
         self.codeword_length: int       = codeword_length
         self.pool_raw:       list[str]  = None
         self.valid_raw:      list[str]  = None
         self.candidates_raw: list[str]  = None
-        self.pool:       np.ndarray     = None
-        self.valid:      np.ndarray     = None
-        self.candidates: np.ndarray     = None
+        self.pool:       np.ndarray     = None # dtype ubyte
+        self.valid:      np.ndarray     = None # dtype ubyte
+        self.candidates: np.ndarray     = None # dtype ubyte
 
         self.dic_encode: dict[str, int] = None
         self.dic_decode: dict[int, str] = None
@@ -59,7 +62,7 @@ class WordleWordlist(object):
 
 
     def encode(self, codeword: str) -> np.ndarray:
-        return np.array([self.dic_encode[x] for x in list(codeword)], dtype=int)
+        return np.array([self.dic_encode[x] for x in list(codeword)], dtype=np.ubyte)
 
 
     def get_symbol_counts_global(self, array: np.ndarray) -> np.ndarray:
@@ -94,7 +97,7 @@ class WordleWordlist(object):
 
     def _encode_pool(self, pool: list[str]) -> np.ndarray:
         n = len(pool)
-        arr = np.zeros((n, self.codeword_length), dtype=int)
+        arr = np.zeros((n, self.codeword_length), dtype=np.ubyte)
         for i in range(n):
             arr[i] = self.encode(pool[i])
         return arr
