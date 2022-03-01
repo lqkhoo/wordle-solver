@@ -1,3 +1,4 @@
+import cupy as cp
 import numpy as np
 
 
@@ -15,7 +16,7 @@ class WordleWordlist(object):
         # @param candidates_path: Filepath to txt file of codewords in the solution set.
         # @param valid_words_path: Filepath to codewords not in the solution set, but are nontheless accepted as valid guesses.
 
-        assert(len(symbols < 256)) # Enforce limitation for encoding codewords in ubytes.
+        assert(len(symbols) < 256) # Enforce limitation for encoding codewords in ubytes.
 
         self.symbols: list[str]         = symbols
         self.codeword_length: int       = codeword_length
@@ -77,7 +78,7 @@ class WordleWordlist(object):
     def get_symbol_counts_by_position(self, array: np.ndarray) -> np.ndarray:
         # Returns a 2d matrix of symbol counts at each position.
         m, n = self.codeword_length, len(self.symbols)
-        mat = np.zeros((m, n), dtype=int)
+        mat = np.empty((m, n), dtype=int)
         array_T = array.T
         for i in range(m):
             uniques, counts = np.unique(array_T[i], return_counts=True)
@@ -97,7 +98,7 @@ class WordleWordlist(object):
 
     def _encode_pool(self, pool: list[str]) -> np.ndarray:
         n = len(pool)
-        arr = np.zeros((n, self.codeword_length), dtype=np.ubyte)
+        arr = np.empty((n, self.codeword_length), dtype=np.ubyte)
         for i in range(n):
             arr[i] = self.encode(pool[i])
         return arr
