@@ -1,6 +1,5 @@
 import cupy as cp
 import numpy as np
-import networkx
 
 from wordlist import ( WordleWordlist )
 
@@ -9,7 +8,7 @@ class WordleSolver(object):
     # Supports arbitrary symbol sets (up to 255 individual symbols) and
     # codeword lengths up to 20 different symbols.
 
-    def __init__(self, wordlist: WordleWordlist, logging: bool=True, verbose: bool=True):
+    def __init__(self, wordlist: WordleWordlist, logging: bool=False, verbose: bool=False):
 
         # Codewords longer than 20 symbols generate more response vectors than
         # could be enumerated using uint32. For practical purposes, most words
@@ -17,19 +16,18 @@ class WordleSolver(object):
         assert(wordlist.codeword_length <= 20)
 
         self._wordlist: WordleWordlist = wordlist
-        self._valid_gpu:         cp.ndarray = None # dtype ubyte
-        self._candidates_gpu:    cp.ndarray = None # dtype ubyte
-        self._response_keys_gpu: cp.ndarray = None # dtype ubyte
-        self.has_gpu: bool = False
+        self._candidates_gpu:    np.ndarray = None # dtype ubyte
+        self._valid_gpu:         np.ndarray = None # dtype ubyte
+        self._pool_gpu:          np.ndarray = None # dtype ubyte
 
-        n_devices = cp.cuda.runtime.getDeviceCount()
-        if n_devices >= 1:
-            self.has_gpu = True
+        self.has_gpu: bool = True if cp.cuda.runtime.getDeviceCount() >= 1 else False
+        if self.has_gpu:
             cp.cuda.runtime.setDevice(0) # Just use the first GPU.
             # Copy arrays to GPU memory.
-            self._valid_gpu = cp.asarray(wordlist.valid)
             self._candidates_gpu = cp.asarray(wordlist.candidates)
-            self._keys_cpu = self.get_response_keys()
+            self._valid_gpu = cp.asarray(wordlist.valid)
+            self._pool_gpu = cp.vstack((self._candidates_gpu, self._valid_gpu))
+            self._keys_cpu = self._get_response_keys()
             self._keys_gpu = cp.asarray(self._keys_cpu)
         else:
             print("WARN: No CUDA device available.")
@@ -46,11 +44,14 @@ class WordleSolver(object):
         return self._wordlist.symbols
 
     @property
+    def candidates(self):
+        return self._candidates_gpu if self.has_gpu else self._wordlist.candidates
+    @property
     def valid(self):
         return self._valid_gpu if self.has_gpu else self._wordlist.valid
     @property
-    def candidates(self):
-        return self._candidates_gpu if self.has_gpu else self._wordlist.candidates
+    def pool(self):
+        return self._pool_gpu if self.has_gpu else self._wordlist.pool
     @property
     def keys(self):
         return self._keys_gpu if self.has_gpu else self._keys_cpu
@@ -80,7 +81,40 @@ class WordleSolver(object):
         self.has_gpu = use_gpu
 
 
-    def get_response_keys(self) -> np.ndarray:
+    def idx2codewords(self, pool_idxs: np.ndarray) -> list[str]:
+        # Synchronizing.
+        # Given an array of indices pointing into rows of self.pool, return
+        # the codewords as a list of raw strings.
+        pool_idxs = cp.asnumpy(pool_idxs) # Sync
+        return self._wordlist.idx2codewords(pool_idxs)
+
+    def codewords2idx(self, strings: list[str]) -> np.ndarray:
+        # Synchronizing.
+        # Given a list of strings, return an array of indices pointing
+        # into codewords in self.pool that correspond to those strings.
+        pool_idxs = self._wordlist.codewords2idx(strings) # cpu
+        if self.has_gpu:
+            pool_idxs = cp.asarray(pool_idxs) # Sync
+        return pool_idxs
+
+    def array2codewords(self, arr: np.ndarray) -> list[str]:
+        # Synchronizing.
+        # Given a 2d array of symbol-encoded codewords, return
+        # the codewords as a list of strings.
+        arr = cp.asnumpy(arr)
+        return self._wordlist.array2codewords(arr)
+
+    def codewords2array(self, strings: list[str]) -> np.ndarray:
+        # Synchronizing.
+        # Given a list of strings, return a 2d array of their
+        # symbol-encoded representation.
+        arr = self._wordlist.codewords2array(strings)
+        if self.has_gpu:
+            arr = cp.asarray(arr) # Sync
+        return arr.ravel()
+
+
+    def _get_response_keys(self) -> np.ndarray:
         # CPU routine.
         # Return all possible response vectors as a 2d matrix of shape (3**k, k),
         # where k is the length of codewords. Valid interval is [0-2] so ubyte.
@@ -97,17 +131,19 @@ class WordleSolver(object):
         return np.ascontiguousarray(mat) # (3**k, k)
 
 
-    def get_response(self, guess: np.ndarray, truth: np.ndarray, encode: bool=True) -> np.ndarray:
+    def compute_responses(self, guess: np.ndarray, truth: np.ndarray) -> np.ndarray:
+        # Where 'g' is the number of guesses and 't' is the number of (potential) truths to test against,
+        # return a matrix of shape (g, t) containing integers encoding the response vectors.
 
-        # For the response vector, we encode as follows:
+        # For the response vector, we encode each symbol position as follows:
         # 0 == no match
         # 1 == inexact match
         # 2 == exact match
 
         xp = cp.get_array_module(guess)
         # Increase dimensionality if we're getting flat arrays
-        if len(xp.shape(guess)) == 1: guess = guess[None,:]
-        if len(xp.shape(truth)) == 1: truth = truth[:,None]
+        guess = xp.atleast_2d(guess)
+        truth = xp.atleast_2d(truth)
 
         g, k = xp.shape(guess) # k == self.codeword_length
         t, _ = xp.shape(truth)
@@ -123,18 +159,18 @@ class WordleSolver(object):
             xp.multiply(exact_matches,   2, dtype=xp.ubyte),
             xp.multiply(inexact_matches, 1, dtype=xp.ubyte)
         ) # (g, t, k)
-        if encode:
-            result = self.encode_response(result) # (g, t) Encode to response keys i.e. single integers in place of the vectors.
+        result = self.encode_response(result) # (g, t) Encode to response keys i.e. single integers in place of the vectors.
         return result # (g, t)
 
     
     def encode_response(self, expanded_response: np.ndarray) -> np.ndarray:
+        # Encodes an array of response vectors into their integer encoding.
         xp = cp.get_array_module(expanded_response)
         k = self.codeword_length
         r = expanded_response # (g, t, k)
         encoder = 3**xp.arange(k)
-        ## r = xp.sum(r * encoder, axis=2)
-        r = xp.sum(xp.multiply(r, encoder, dtype=self.response_enc_dtype), axis=2)
+        ## r = xp.sum(r * encoder, axis=-1)
+        r = xp.sum(xp.multiply(r, encoder, dtype=self.response_enc_dtype), axis=-1)
         return r # (g, t)
 
 
@@ -145,9 +181,9 @@ class WordleSolver(object):
         k = self.codeword_length
         c = xp.copy(compact_response) # (g, t)
         g, t = xp.shape(c)
-        r = xp.zeros((g, t, k), dtype=xp.ubyte)
+        r = xp.empty((g, t, k), dtype=xp.ubyte)
         for i in range(k):
-            r[:,:,i] = c % 3
+            r[:,:,i] = c % 3 # (g, t)
             c = c // 3
         return r # (g, t, k)
     
@@ -157,9 +193,100 @@ class WordleSolver(object):
 
 
     def solve(self, truth_raw: str, max_iters: int=10):
-        # Generate solution path given the truth string.
-        # This obviously cannot be used in an interactive setting.
-        raise NotImplementedError()
+        # Simulate a solving session with a given truth value (string) to check convergence.
+
+        assert(truth_raw in self._wordlist.candidates_raw)
+        xp = cp if self.has_gpu else np
+
+        # For logging only
+        guesses = []
+        messages = []
+        remaining = []
+
+        truth = self.codewords2array(truth_raw) # (k, )
+        candidates, pool = self.candidates, self.pool
+
+        n_keys = xp.shape(self.keys)[0]
+        c, _ = xp.shape(candidates)
+
+        # Compute all possible responses for all pairs of (pool, candidate).
+        # (p, c) dtype uint8 matrix. Each row (for each guess) contains
+        # the response key encoding the appropriate response vector for each possible solution.
+        R = self.compute_responses(pool, candidates) # (p, c)
+
+        # This keeps track of which candidate indices are still live. Used for tracking live
+        # indices when selecting from the pool.
+        live_cidxs = xp.arange(c)
+
+        if self.verbose:
+            p, _ = xp.shape(pool)
+            print(f"Computed responses for {p} x {c} pairs. Solving:")
+
+        nsteps = 1
+        for _ in range(max_iters):
+
+            # Logging
+            if self.verbose:
+                print(f"Time step: {nsteps}")
+
+            # Get best guess.
+            guess_idx = self.get_best_guess(candidates, pool, R, live_cidxs) # scalar
+
+            # Generate response.
+            R_row = R[guess_idx] # (c, )
+            mask = (truth[None,:] == candidates)
+            truth_idx = xp.argwhere(xp.all(mask, axis=1))[0] # scalar
+            response = R_row[truth_idx][0] # scalar
+
+            # Logging
+            if self.logging:
+                guess_raw = self.idx2codewords(guess_idx)[0]
+                response_raw = self.keys[response]
+                guesses.append(guess_raw)
+                messages.append(response_raw)
+                if self.verbose:
+                    print("  Best guess {}: '{}', response: {}".format(nsteps, guess_raw, response_raw))
+
+            # Check for winning condition.
+            if response == n_keys-1:
+                # Logging
+                if self.verbose:
+                    print(f"SOLVED in {nsteps} steps.")
+
+                break
+
+            # Partition remaining candidates.
+            # 1. Generate the mask,
+            # 2. Eliminate the columns of R that correspond to eliminated candidates.
+            # 3. Eliminate the rows in candidates that correspond to eliminated candidates.
+            c, k = xp.shape(candidates) # Recompute c
+            idxs = xp.arange(c)[R_row == response]
+            R = R[:,idxs]
+            candidates = candidates[idxs,:]
+            live_cidxs = live_cidxs[idxs]
+
+            # Logging
+            if self.logging:
+                candidates_raw = self.idx2codewords(live_cidxs)
+                remaining.append(candidates_raw)
+                if self.verbose:
+                    print("    Partition ({}): {}".format(len(candidates_raw), candidates_raw))
+
+            nsteps += 1
+
+        return candidates.ravel(), nsteps, guesses, messages
+
+
+class WordleSimpleSolver(WordleSolver):
+    # This solver simply picks the first available solution.
+
+    def __init__(self, wordlist, logging: bool=False, verbose: bool=False):
+        super().__init__(wordlist, logging, verbose)
+
+    def get_best_guess(self, candidates: np.ndarray, pool: np.ndarray,
+                        responses: np.ndarray, live_cidxs: np.ndarray) -> int:
+        return live_cidxs[0]
+        
 
 
 
@@ -167,9 +294,9 @@ class WordleMinimaxSolver(WordleSolver):
     # Wordle solver implementation using Knuth's minimax algorithm, which he used
     # to solve MM(4,6) Mastermind in 1976. Minimax selects the guess which produces
     # a partitioning which has the smallest largest resulting partition of the 
-    # solution space. Hence minimax.
+    # solution space. Note: This is not minimax search used for 2-player games.
 
-    def __init__(self, wordlist, logging: bool=True, verbose: bool=True):
+    def __init__(self, wordlist, logging: bool=False, verbose: bool=False):
         super().__init__(wordlist, logging, verbose)
 
 
@@ -180,7 +307,7 @@ class WordleMinimaxSolver(WordleSolver):
         # pool:       (P, k)   This is the same every time step.
         # responses:  (P, c)   Array of responses vs current candidates. Changes every time step.
         # live_cidxs: (c, )    This array is used to track the indices of current candidates in pool / responses.
-        #                      e.g. if used as fancy index 'pool[live_cidxs]' is called, it returns
+        #                      e.g. if used as fancy index 'pool[live_cidxs]', it returns
         #                      a sliced copy of pool that is equal to 'candidates'.
 
         xp = cp.get_array_module(candidates)
@@ -222,11 +349,7 @@ class WordleMinimaxSolver(WordleSolver):
                 guess_idxs = test_idxs
         # Logging
         if self.verbose:
-            guesses_raw = []
-            guesses_cpu = pool[guess_idxs].get()
-            for g in guesses_cpu:
-                guesses_raw.append(self._wordlist.decode(g))
-            print("  Minimax guesses ({}): {}".format(guess_idxs.shape[0], guesses_raw))
+            print("  Minimax guesses ({}): {}".format(guess_idxs.shape[0], self.idx2codewords(guess_idxs)))
 
         # Tiebreaking lvl 2: Prioritize guesses which are in the candidate set.
         test_idxs = guess_idxs[xp.isin(guess_idxs, live_cidxs)]
@@ -238,103 +361,11 @@ class WordleMinimaxSolver(WordleSolver):
             guess_idxs = test_idxs
             # Logging
             if self.verbose:
-                guesses_raw = []
-                guesses_cpu = pool[guess_idxs].get()
-                for g in guesses_cpu:
-                    guesses_raw.append(self._wordlist.decode(g))
-                print("  Minimax guesses (candidates) ({}): {}".format(guess_idxs.shape[0], guesses_raw))
+                print("  Minimax guesses (candidates) ({}): {}".format(guess_idxs.shape[0], self.idx2codewords(guess_idxs)))
 
         # Despite tiebreaking, by symmetry, we may still have more than one minimax guess.
         best_guess_idx = guess_idxs[0] # In that case, just pick the first such one.
+
         return best_guess_idx
 
-
-    def solve(self, truth_raw: str, max_iters: int=10):
-        # Simulate a solving session with a given truth value (string) to check convergence.
-
-        assert(truth_raw in self._wordlist.candidates_raw)
-        xp = cp if self.has_gpu else np
-
-        # For logging only
-        guesses = []
-        messages = []
-        remaining = []
-
-        n_keys = xp.shape(self.keys)[0]
-        truth = xp.asarray(self._wordlist.encode(truth_raw))
-        candidates, valid = self.candidates, self.valid
-        c, k = xp.shape(candidates)
-
-        pool = xp.vstack((candidates, valid)) # (p, k)
-
-        # Compute all possible responses for all pairs of (pool, candidate).
-        # (p, c) dtype uint8 matrix. Each row (for each guess) contains
-        # the response key encoding the appropriate response vector for each possible solution.
-        R = self.get_response(pool, candidates) # (p, c)
-
-        # This keeps track of which candidate indices are still live. Used for tracking live
-        # indices when selecting from the pool.
-        live_cidxs = xp.arange(c)
-
-        nsteps = 1
-        for _ in range(max_iters):
-            
-            # Logging
-            if self.verbose:
-                print(f"Time step: {nsteps}")
-
-            c, k = xp.shape(candidates)
-
-            # Get best guess.
-            guess_idx = self.get_best_guess(candidates, pool, R, live_cidxs) # scalar
-
-            # Logging
-            if self.logging:
-                guess_raw = self._wordlist.decode(pool[guess_idx].get())
-                guesses.append(guess_raw)
-
-            # Generate response.
-            R_row = R[guess_idx] # (c, )
-            mask = (truth[None,:] == candidates)
-            truth_idx = xp.argwhere(xp.all(mask, axis=1))[0] # scalar
-            response = R_row[truth_idx][0] # scalar
-
-            # Logging
-            if self.logging:
-                response_raw = self._keys_gpu[response]
-                messages.append(response_raw)
-                if self.verbose:
-                    print("  Best guess {}: '{}', response: {}".format(nsteps, guess_raw, response_raw))
-
-            # Check for winning condition.
-            if response == n_keys-1:
-                # Logging
-                if self.verbose:
-                    print(f"SOLVED in {nsteps} steps.")
-
-                break
-
-            # Partition remaining candidates.
-            # 1. Generate the mask,
-            # 2. Eliminate the columns of R that correspond to eliminated candidates.
-            # 3. Eliminate the rows in candidates that correspond to eliminated candidates.
-            mask = (R_row == response)
-            idx = xp.arange(c)[mask]
-            R = R[:,idx]
-            candidates = candidates[idx,:]
-            live_cidxs = live_cidxs[idx]
-
-            # Logging
-            if self.logging:
-                candidates_cpu = candidates.get()
-                candidates_raw = []
-                for c in candidates_cpu:
-                    candidates_raw.append(self._wordlist.decode(c))
-                remaining.append(candidates_raw)
-                if self.verbose:
-                    print("    Partition ({}): {}".format(len(candidates_raw), candidates_raw))
-
-            nsteps += 1
-
-        return candidates.ravel(), nsteps, guesses, messages
         
