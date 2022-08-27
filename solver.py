@@ -1,6 +1,9 @@
 import cupy as cp
 import numpy as np
 
+# GPU profiling tools
+import nvtx
+
 from wordlist import ( WordleWordlist )
 
 class WordleSolver(object):
@@ -34,7 +37,6 @@ class WordleSolver(object):
 
         self.logging: bool = logging
         self.verbose: bool = verbose
-
 
     @property
     def codeword_length(self):
@@ -130,7 +132,7 @@ class WordleSolver(object):
         mat = np.fliplr(mat)
         return np.ascontiguousarray(mat) # (3**k, k)
 
-
+    @nvtx.annotate(color='yellow')
     def compute_responses(self, guess: np.ndarray, truth: np.ndarray) -> np.ndarray:
         # Where 'g' is the number of guesses and 't' is the number of (potential) truths to test against,
         # return a matrix of shape (g, t) containing integers encoding the response vectors.
@@ -191,7 +193,7 @@ class WordleSolver(object):
     def get_best_guess(self, candidates: np.ndarray, pool: np.ndarray, responses: np.ndarray, live_cidxs) -> int:
         raise NotImplementedError()
 
-
+    @nvtx.annotate(color='red')
     def solve(self, truth_raw: str, max_iters: int=10):
         # Simulate a solving session with a given truth value (string) to check convergence.
 
@@ -205,8 +207,9 @@ class WordleSolver(object):
 
         truth = self.codewords2array(truth_raw) # (k, )
         candidates, pool = self.candidates, self.pool
+        keys = self.keys
 
-        n_keys = xp.shape(self.keys)[0]
+        n_keys = xp.shape(keys)[0]
         c, _ = xp.shape(candidates)
 
         # Compute all possible responses for all pairs of (pool, candidate).
@@ -241,7 +244,7 @@ class WordleSolver(object):
             # Logging
             if self.logging:
                 guess_raw = self.idx2codewords(guess_idx)[0]
-                response_raw = self.keys[response]
+                response_raw = keys[response]
                 guesses.append(guess_raw)
                 messages.append(response_raw)
                 if self.verbose:
@@ -277,6 +280,7 @@ class WordleSolver(object):
         return candidates.ravel(), nsteps, guesses, messages
 
 
+
 class WordleSimpleSolver(WordleSolver):
     # This solver simply picks the first available solution.
 
@@ -289,7 +293,6 @@ class WordleSimpleSolver(WordleSolver):
         
 
 
-
 class WordleMinimaxSolver(WordleSolver):
     # Wordle solver implementation using Knuth's minimax algorithm, which he used
     # to solve MM(4,6) Mastermind in 1976. Minimax selects the guess which produces
@@ -299,7 +302,7 @@ class WordleMinimaxSolver(WordleSolver):
     def __init__(self, wordlist, logging: bool=False, verbose: bool=False):
         super().__init__(wordlist, logging, verbose)
 
-
+    @nvtx.annotate(color='green')
     def get_best_guess(self, candidates: np.ndarray, pool: np.ndarray,
                         responses: np.ndarray, live_cidxs: np.ndarray) -> int:
         # Let C, V, P=V+C be the sizes of the *initial* candidate, valid, and pool arrays. k is codeword length.
@@ -368,4 +371,29 @@ class WordleMinimaxSolver(WordleSolver):
 
         return best_guess_idx
 
+
+
+class WordleMaxEntropySolver(WordleSolver):
+
+    def __init__(self, wordlist, logging: bool=False, verbose: bool=False):
+        super().__init__(wordlist, logging, verbose)
+
+    def get_best_guess(self, candidates: np.ndarray, pool: np.ndarray,
+                        responses: np.ndarray, live_cidxs: np.ndarray) -> int:
         
+        xp = cp.get_array_module(candidates)
+
+        # Short-circuit when there's only one valid guess left. That's our answer.
+        if xp.shape(live_cidxs)[0] == 1:
+            # Logging
+            if self.verbose:
+                print("  Single candidate left. Short-circuit.")
+
+            return live_cidxs[0]
+
+        p, k = xp.shape(pool)
+        n_keys = xp.shape(self.keys)[0]
+
+        # (p, n_keys) dtype int64 matrix. Each row (for each guess) contains
+        # the sizes of resulting partitions w.r.t. each possible response key.
+        psizes = xp.apply_along_axis(xp.bincount, 1, responses, minlength=n_keys)

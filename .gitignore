@@ -1,2 +1,6 @@
 .ipynb_checkpoints/
 __pycache__/
+
+# nvidia nsight system / visual profiler outputs
+*.nsys-rep
+*.nvvp

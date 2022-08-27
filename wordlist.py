@@ -7,7 +7,7 @@ SYM_ENGLISH = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", 
 
 
 class WordleWordlist(object):
-    # This class is fully CPU-only.
+    # CPU-only class.
 
     def __init__(self, codeword_length: int, symbols_raw: list[str], candidates_path: str, valid_words_path: str=None):
         # codeword_length: The fixed length of codewords for this wordle. Original is 5.
